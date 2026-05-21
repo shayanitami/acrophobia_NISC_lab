@@ -54,6 +54,9 @@ if __name__ == "__main__":
     total_samples = 0
     eda_buffer=[]
     ecg_buffer=[]
+    
+    eda_alpha = 0.005
+    eda_smoothed = None
 
     while time.time()-start <20:
         chunk,timestamps=inlet.pull_chunk(timeout=0.0, max_samples=1000)
@@ -61,12 +64,15 @@ if __name__ == "__main__":
         for sample in chunk:
             eda_buffer.append(sample[eda_ch])
             ecg_buffer.append(sample[ecg_ch])
-
+            if eda_smoothed is None:
+                eda_smoothed=sample[eda_ch]
+            else:
+                eda_smoothed=eda_alpha*sample[eda_ch]+(1-eda_alpha)*eda_smoothed
         if tick%5==0:
             if len(chunk)==0:
                 print("got 0 samples")
             else:
-                print(f"got {len(chunk)} samples. first sample:{chunk[0]}")
+                print(f"got {len(chunk)} samples| raw_EDA={sample[eda_ch]:.4f} | smoothed EDA={eda_smoothed:.4f} μS")
         tick=tick+1
         time.sleep(0.02)
 
@@ -77,5 +83,5 @@ if __name__ == "__main__":
     print(f"the eda_buffer length is {len(eda_buffer)}and the last value is {eda_buffer[-1]}")
 
 
-
+    
 
