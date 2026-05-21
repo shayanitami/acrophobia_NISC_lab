@@ -1,0 +1,29 @@
+
+n
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual environment
+vret_env/
+
+# OpenSignals raw recordings (large, not source code)
+*.h5
+*.edf
+opensignals_*.txt
+fake_opensignals_*.txt
+
+
+# vim swap and undo files
+*~
+*.un~
+.*.un~
+*.swp
+*.swo
+
+
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+*.swp
