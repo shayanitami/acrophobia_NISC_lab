@@ -1,6 +1,7 @@
 from pylsl import StreamInlet, resolve_streams
 import time
-
+import neurokit2 as nk
+import numpy as np
 
 def connect_to_opensignals():
     print("[LSL] is searching for opensignals stream...")
@@ -57,6 +58,7 @@ if __name__ == "__main__":
     
     eda_alpha = 0.005
     eda_smoothed = None
+    hr_bpm=None
 
     while time.time()-start <20:
         chunk,timestamps=inlet.pull_chunk(timeout=0.0, max_samples=1000)
@@ -68,11 +70,26 @@ if __name__ == "__main__":
                 eda_smoothed=sample[eda_ch]
             else:
                 eda_smoothed=eda_alpha*sample[eda_ch]+(1-eda_alpha)*eda_smoothed
+        if tick%10==0:
+            if len(ecg_buffer)>=5000:
+                window=np.array(ecg_buffer[-10000:])
+                peaks,info=nk.ecg_peaks(window,sampling_rate=1000) #peaks we don't need. info is a dictionary with keys.one of them is ECG_R_Peaks.
+                r_peak_indices=info['ECG_R_Peaks'] 
+                rr_intervals_ms=np.diff(r_peak_indices)
+                valid_rr = (rr_intervals_ms >= 300) & (rr_intervals_ms <= 1500)
+                rr_clean = rr_intervals_ms[valid_rr]
+                if len(rr_clean) > 0:
+                    hr_bpm = 60000 / rr_clean[-1]
+                else:
+                    hr_bpm = None
+                
+        
         if tick%5==0:
             if len(chunk)==0:
                 print("got 0 samples")
             else:
-                print(f"got {len(chunk)} samples| raw_EDA={sample[eda_ch]:.4f} | smoothed EDA={eda_smoothed:.4f} μS")
+                hr_str = f"{hr_bpm:.1f}" if hr_bpm is not None else "—"
+                print(f"got {len(chunk)} samples| raw_EDA={sample[eda_ch]:.4f} | smoothed EDA={eda_smoothed:.4f} μS | HR={hr_str} BPM")
         tick=tick+1
         time.sleep(0.02)
 
