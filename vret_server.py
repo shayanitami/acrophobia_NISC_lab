@@ -6,7 +6,7 @@ import numpy as np
 def connect_to_opensignals():
     print("[LSL] is searching for opensignals stream...")
     for j in range(30):
-        streams=resolve_streams(wait_time=2.0)
+        streams=resolve_streams(wait_time=2.0)#lsl is not instant and finding it requires time.
         if streams==[]:
             if j!=29:
                 print(f"attempt{j+1}==>no streams found retrying\n")
@@ -24,13 +24,13 @@ def connect_to_opensignals():
                      f"source={streams[i].source_id()}"
                      )
                 if streams[i].channel_count()==2 or streams[i].channel_count()==3:
-                    opensignalstream=streams[i]
+                    opensignalstream=streams[i] #opensignnalstream is stream info. a description. 
                     break
             if opensignalstream is None:
                     raise RuntimeError("Streams found but none with 2 or 3 channels")
             break
         
-    inlet=StreamInlet(opensignalstream)
+    inlet=StreamInlet(opensignalstream) #here we make the connection and read the stream. TCP connection made
     if opensignalstream.channel_count()==2:
         eda_channel=0
         ecg_channel=1
@@ -58,9 +58,11 @@ if __name__ == "__main__":
     
     eda_alpha = 0.005
     eda_smoothed = None
-    hr_bpm=None
 
-    while time.time()-start <20:
+    hr_bpm=None
+    rmssd_ms=None
+
+    while time.time()-start <20: #20 seconds is just the duration of testing the code. after trial it gets removed. it is so we won't wait forever for the tests to end.
         chunk,timestamps=inlet.pull_chunk(timeout=0.0, max_samples=1000)
         total_samples = total_samples + len(chunk)
         for sample in chunk:
@@ -78,18 +80,29 @@ if __name__ == "__main__":
                 rr_intervals_ms=np.diff(r_peak_indices)
                 valid_rr = (rr_intervals_ms >= 300) & (rr_intervals_ms <= 1500)
                 rr_clean = rr_intervals_ms[valid_rr]
+               
                 if len(rr_clean) > 0:
                     hr_bpm = 60000 / rr_clean[-1]
                 else:
                     hr_bpm = None
-                
+                #HRV    
+                if len(rr_clean)<2:
+                    rmssd_ms=None
+                else:
+                    rr_diffs=np.diff(rr_clean[-60:]) #for hrv
+                    squared=rr_diffs**2
+                    mean_sq=np.mean(squared)
+                    rmssd_ms=np.sqrt(mean_sq)
+ 
         
         if tick%5==0:
             if len(chunk)==0:
                 print("got 0 samples")
             else:
                 hr_str = f"{hr_bpm:.1f}" if hr_bpm is not None else "—"
-                print(f"got {len(chunk)} samples| raw_EDA={sample[eda_ch]:.4f} | smoothed EDA={eda_smoothed:.4f} μS | HR={hr_str} BPM")
+                rmssd_str = f"{rmssd_ms:.1f}" if rmssd_ms is not None else "—"
+                print(f"got {len(chunk)} samples| raw_EDA={sample[eda_ch]:.4f} | smoothed EDA={eda_smoothed:.4f} μS | HR={hr_str} BPM | RMSSD={rmssd_str} ms")
+
         tick=tick+1
         time.sleep(0.02)
 
