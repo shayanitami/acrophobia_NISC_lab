@@ -1,4 +1,5 @@
 from pylsl import StreamInlet, resolve_streams
+from collections import deque
 import time
 import neurokit2 as nk
 import numpy as np
@@ -15,8 +16,8 @@ LOOP_SLEEP_S            = 1.0 / LOOP_RATE_HZ # derived: 0.02 s
 PULL_CHUNK_MAX_SAMPLES  = 1000              # safety cap per pull (~1 s of buffered data at 1 kHz)
 
 # --- Phase durations ---
-BASELINE_DURATION_S     = 30                # bump to 120 for real sessions(for testing just change it to smaller amounts)
-LIVE_DURATION_S         = 600               # 10-minute live phase
+BASELINE_DURATION_S     = 120               # bump to 120 for real sessions(for testing just change it to smaller amounts)
+LIVE_DURATION_S         = 60               # 1 minute long live phase
 
 # --- EDA smoothing (EMA) ---
 EDA_ALPHA               = 0.005             # smaller = heavier smoothing; ~200-sample time constant
@@ -239,4 +240,86 @@ if __name__ == "__main__":
     print(f"avg_eda = {avg_eda:.4f} μS")
     print(f"sigma_baseline = {sigma_baseline:.4f}")
 
+
+    input("press enter to start the live session")
+    total_drained = 0
+    while True:
+        chunk, _ = inlet.pull_chunk(timeout=0.0, max_samples=PULL_CHUNK_MAX_SAMPLES)
+        if len(chunk)==0:
+            break
+        total_drained=len(chunk)+total_drained
+
+    print(f"total amount of {total_drained} samples were drained from the buffers to start live phase fresh")
+
+
+
+    # --- State reset for starting the live session ---
+    del eda_buffer, eda_smoothed_buffer,hr_buffer, rmssd_buffer,ecg_buffer
+    eda_smoothed=None
+    hr_bpm=None
+    rmssd_ms=None
+    tick=0
+    total_samples=0
+    ecg_buffer = deque(maxlen=ECG_WINDOW_SAMPLES)
+
+    start=time.time()
+
+
+    #live session start loop
+    while time.time()-start<LIVE_DURATION_S:
+        chunk,timestamps = inlet.pull_chunk(timeout=0.0, max_samples=PULL_CHUNK_MAX_SAMPLES)
+        total_samples=len(chunk)+total_samples
+        for sample in chunk:
+            ecg_buffer.append(sample[ecg_ch])
+
+            if eda_smoothed is None:
+                eda_smoothed=sample[eda_ch]
+            else:
+                eda_smoothed=EDA_ALPHA * sample[eda_ch] + (1 - EDA_ALPHA) * eda_smoothed 
+
+        
+        if tick%HR_COMPUTE_INTERVAL==0:
+
+            if len(ecg_buffer)>=ECG_MIN_SAMPLES_FOR_HR:
+
+                window=np.array(ecg_buffer)
+                peaks,info=nk.ecg_peaks(window,sampling_rate=SAMPLING_RATE_HZ) 
+                r_peak_indices=info['ECG_R_Peaks'] 
+                rr_intervals_ms=np.diff(r_peak_indices)
+                valid_rr = (rr_intervals_ms >= RR_MIN_MS) & (rr_intervals_ms <=RR_MAX_MS)
+                rr_clean = rr_intervals_ms[valid_rr]
+                   
+                if len(rr_clean) > 0:
+                    hr_bpm = 60000 / rr_clean[-1]
+
+                else:
+                    hr_bpm = None
+
+                #HRV    
+                if len(rr_clean)<2:
+                    rmssd_ms=None
+                else:
+                    rr_diffs=np.diff(rr_clean[-RMSSD_WINDOW_BEATS:]) #for hrv
+                    squared=rr_diffs**2
+                    mean_sq=np.mean(squared)
+                    rmssd_ms=np.sqrt(mean_sq)
+
+        if tick%PRINT_INTERVAL==0:
+            if len(chunk)==0:
+                print("[LIVE] got 0 samples")
+            else:
+                hr_str = f"{hr_bpm:.1f}" if hr_bpm is not None else "—"
+                rmssd_str = f"{rmssd_ms:.1f}" if rmssd_ms is not None else "—"
+                print(f"[LIVE] got {len(chunk)} samples| raw_EDA={sample[eda_ch]:.4f} | smoothed EDA={eda_smoothed:.4f} μS | HR={hr_str} BPM | RMSSD={rmssd_str} ms")
+
+            
+        tick=tick+1
+        time.sleep(LOOP_SLEEP_S)
+
+    elapsed = time.time() - start
+    print(f"\n=== Live phase complete ===")
+    print(f"[LIVE] Duration: {elapsed:.2f} s")
+    print(f"[LIVE] Total raw samples: {total_samples}")
+    print(f"[LIVE] Effective rate: {total_samples / elapsed:.1f} Hz")
+    print(f"[LIVE] ecg_buffer (deque): {len(ecg_buffer)} / {ECG_WINDOW_SAMPLES} samples")
 
