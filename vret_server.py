@@ -3,6 +3,53 @@ import time
 import neurokit2 as nk
 import numpy as np
 
+
+# ============================================================
+# CONFIGURATION — change values here for different uses of our biofeedback
+# ============================================================
+
+# --- Hardware / acquisition ---
+SAMPLING_RATE_HZ        = 1000              # PLUX hub setting; LSL stream rate; the default on our tool
+LOOP_RATE_HZ            = 50                # how often the Python loop ticks
+LOOP_SLEEP_S            = 1.0 / LOOP_RATE_HZ # derived: 0.02 s
+PULL_CHUNK_MAX_SAMPLES  = 1000              # safety cap per pull (~1 s of buffered data at 1 kHz)
+
+# --- Phase durations ---
+BASELINE_DURATION_S     = 30                # bump to 120 for real sessions(for testing just change it to smaller amounts)
+LIVE_DURATION_S         = 600               # 10-minute live phase
+
+# --- EDA smoothing (EMA) ---
+EDA_ALPHA               = 0.005             # smaller = heavier smoothing; ~200-sample time constant
+
+# --- ECG / HR / RMSSD ---
+ECG_MIN_SAMPLES_FOR_HR  = 5000              # don't try R-peak detection until buffer has this many(it won't be scientific)
+ECG_WINDOW_SAMPLES      = 10000             # R-peak detection window (~10 s at 1 kHz)
+HR_COMPUTE_INTERVAL     = 10                # compute HR every N ticks (10 → 5 Hz at 50 Hz loop)
+PRINT_INTERVAL          = 5                 # print every N ticks (5 → 10 Hz at 50 Hz loop)
+RR_MIN_MS               = 300               # filter: ignore RR shorter than this (>200 BPM)
+RR_MAX_MS               = 1500              # filter: ignore RR longer than this (<40 BPM)
+RMSSD_WINDOW_BEATS      = 60                # how many recent RR intervals to use for RMSSD
+
+# --- Baseline cleaning ---
+SIGMA_THRESHOLD         = 3                 # 3σ rule for outlier removal
+
+# --- Live-phase math (Stage 4, defined now for completeness) ---
+WEIGHT_EDA              = 0.5               # weight of ΔEDA in S_instant
+WEIGHT_HRV              = 0.3               # weight of ΔHRV in S_instant
+WEIGHT_HR               = 0.2               # weight of ΔHR in S_instant
+ST_ROLLING_WINDOW_S     = 1.0               # rolling-mean window for S_t (in seconds)
+THRESHOLD_MILD_K        = 1.33              # thresh_mild = k × σ_baseline
+THRESHOLD_HIGH_K        = 2.28              # thresh_high = k × σ_baseline
+
+# --- Balloon mapping (Stage 4) ---
+BALLOON_Y_LOW           = 0                 # minimum balloon altitude (units TBD)
+BALLOON_Y_HIGH          = 100               # maximum balloon altitude
+
+# ============================================================
+
+
+
+
 def connect_to_opensignals():
 
     print("[LSL] is searching for opensignals stream...")
@@ -64,7 +111,6 @@ if __name__ == "__main__":
     eda_buffer=[]
     ecg_buffer=[]
     
-    eda_alpha = 0.005
     eda_smoothed = None
     hr_bpm=None
     rmssd_ms=None
@@ -73,8 +119,8 @@ if __name__ == "__main__":
     hr_buffer=[]
     rmssd_buffer=[]
 
-    while time.time()-start <30: #30 seconds is just the duration of testing the code. after trial it gets removed. it is so we won't wait forever for the tests to end.
-        chunk,timestamps=inlet.pull_chunk(timeout=0.0, max_samples=1000)
+    while time.time()-start <BASELINE_DURATION_S: 
+        chunk, timestamps = inlet.pull_chunk(timeout=0.0, max_samples=PULL_CHUNK_MAX_SAMPLES)
         total_samples = total_samples + len(chunk)
 
         for sample in chunk:
@@ -84,17 +130,18 @@ if __name__ == "__main__":
             if eda_smoothed is None:
                 eda_smoothed=sample[eda_ch]
             else:
-                eda_smoothed=eda_alpha*sample[eda_ch]+(1-eda_alpha)*eda_smoothed
+                eda_smoothed=EDA_ALPHA * sample[eda_ch] + (1 - EDA_ALPHA) * eda_smoothed 
             eda_smoothed_buffer.append(eda_smoothed)
 
-        if tick%10==0:
+        if tick%HR_COMPUTE_INTERVAL==0:
 
-            if len(ecg_buffer)>=5000:
-                window=np.array(ecg_buffer[-10000:])
-                peaks,info=nk.ecg_peaks(window,sampling_rate=1000) #peaks we don't need. info is a dictionary with keys.one of them is ECG_R_Peaks.
+            if len(ecg_buffer)>=ECG_MIN_SAMPLES_FOR_HR:
+
+                window=np.array(ecg_buffer[-ECG_WINDOW_SAMPLES:])
+                peaks,info=nk.ecg_peaks(window,sampling_rate=SAMPLING_RATE_HZ) #peaks we don't need. info is a dictionary with keys.one of them is ECG_R_Peaks.
                 r_peak_indices=info['ECG_R_Peaks'] 
                 rr_intervals_ms=np.diff(r_peak_indices)
-                valid_rr = (rr_intervals_ms >= 300) & (rr_intervals_ms <= 1500)
+                valid_rr = (rr_intervals_ms >= RR_MIN_MS) & (rr_intervals_ms <=RR_MAX_MS)
                 rr_clean = rr_intervals_ms[valid_rr]
                
                 if len(rr_clean) > 0:
@@ -107,7 +154,7 @@ if __name__ == "__main__":
                 if len(rr_clean)<2:
                     rmssd_ms=None
                 else:
-                    rr_diffs=np.diff(rr_clean[-60:]) #for hrv
+                    rr_diffs=np.diff(rr_clean[-RMSSD_WINDOW_BEATS:]) #for hrv
                     squared=rr_diffs**2
                     mean_sq=np.mean(squared)
                     rmssd_ms=np.sqrt(mean_sq)
@@ -118,7 +165,7 @@ if __name__ == "__main__":
                     rmssd_buffer.append(rmssd_ms)
  
         
-        if tick%5==0:
+        if tick%PRINT_INTERVAL==0:
 
             if len(chunk)==0:
                 print("got 0 samples")
@@ -128,8 +175,7 @@ if __name__ == "__main__":
                 print(f"got {len(chunk)} samples| raw_EDA={sample[eda_ch]:.4f} | smoothed EDA={eda_smoothed:.4f} μS | HR={hr_str} BPM | RMSSD={rmssd_str} ms")
 
         tick=tick+1
-        time.sleep(0.02)
-
+        time.sleep(LOOP_SLEEP_S)
     elapsed = time.time() - start
    
     print(f"\n=== Baseline collection complete ===")
@@ -145,15 +191,52 @@ if __name__ == "__main__":
     def clean_and_mean(buffer):
         arr = np.array(buffer)
         mu, sigma = np.mean(arr), np.std(arr)
-        cleaned = arr[np.abs(arr - mu) <= 3*sigma]
+        cleaned = arr[np.abs(arr - mu) <= SIGMA_THRESHOLD * sigma] 
         return np.mean(cleaned)
 
     avg_hr= clean_and_mean(hr_buffer)
     avg_hrv= clean_and_mean(rmssd_buffer)
     avg_eda= clean_and_mean(eda_smoothed_buffer)
 
+
+    total_ticks = int(BASELINE_DURATION_S * LOOP_RATE_HZ)
+    eda_arr = np.array(eda_smoothed_buffer)
+    hr_arr = np.array(hr_buffer)
+    rmssd_arr = np.array(rmssd_buffer)
+
+    s_instant_history = []
+    s_t_buffer = []
+    s_t_history = []
+
+    rolling_window_samples = int(ST_ROLLING_WINDOW_S * LOOP_RATE_HZ)
+    for n in range(total_ticks):
+        eda_idx = int(n * len(eda_arr) / total_ticks)
+        hr_idx = int(n * len(hr_arr) / total_ticks)
+    
+        current_eda = eda_arr[eda_idx]
+        current_hr = hr_arr[hr_idx]
+        current_rmssd = rmssd_arr[hr_idx]
+
+        delta_eda = (current_eda - avg_eda) / avg_eda * 100
+        delta_hr = (current_hr - avg_hr) / avg_hr * 100
+        delta_hrv = (avg_hrv - current_rmssd) / avg_hrv * 100
+
+        s_instant = (WEIGHT_EDA * delta_eda + WEIGHT_HRV * delta_hrv + WEIGHT_HR * delta_hr)
+        s_instant_history.append(s_instant)
+
+        s_t_buffer.append(s_instant)
+        if len(s_t_buffer) > rolling_window_samples:
+            s_t_buffer.pop(0)
+        s_t = np.mean(s_t_buffer)
+        s_t_history.append(s_t)
+
+    sigma_baseline = np.std(s_t_history)
+
+
     print(f"\n=== Frozen baseline averages ===")
     print(f"avg_hr  = {avg_hr:.2f} BPM")
     print(f"avg_hrv = {avg_hrv:.2f} ms")
     print(f"avg_eda = {avg_eda:.4f} μS")
+    print(f"sigma_baseline = {sigma_baseline:.4f}")
+
 
