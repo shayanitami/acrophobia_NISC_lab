@@ -17,7 +17,7 @@ PULL_CHUNK_MAX_SAMPLES  = 1000              # safety cap per pull (~1 s of buffe
 
 # --- Phase durations ---
 BASELINE_DURATION_S     = 120               # bump to 120 for real sessions(for testing just change it to smaller amounts)
-LIVE_DURATION_S         = 60               # 1 minute long live phase
+LIVE_DURATION_S         = 720               # 1 minute long live phase
 
 # --- EDA smoothing (EMA) ---
 EDA_ALPHA               = 0.005             # smaller = heavier smoothing; ~200-sample time constant
@@ -88,11 +88,11 @@ def connect_to_opensignals():
     inlet=StreamInlet(opensignalstream) #here we make the connection and read the stream. TCP connection made
 
     if opensignalstream.channel_count()==2:
-        eda_channel=1
-        ecg_channel=0
-    elif opensignalstream.channel_count()==3:
-        eda_channel=2
+        eda_channel=0
         ecg_channel=1
+    elif opensignalstream.channel_count()==3:
+        eda_channel=1
+        ecg_channel=2
 
     return [inlet,eda_channel,ecg_channel]
 

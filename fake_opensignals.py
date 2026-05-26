@@ -11,7 +11,7 @@ info = StreamInfo(
             source_id='OpenSignals'
             )
 
-data=np.loadtxt(r"C:\Users\Shayan\Desktop\NICS\acrophobia\shayan_code\vret_pipeline\paria_onmylaptop_opensignals_2026-05-25_15-13-39.txt",skiprows=3)
+data=np.loadtxt(r"C:\Users\Shayan\Desktop\NICS\acrophobia\shayan_code\vret_pipeline\14_minute_test_of_myself_2026-05-26_16-47-36.txt",skiprows=3)
 outlet = StreamOutlet(info)
 rows,columns=data.shape
 print(rows)
@@ -26,4 +26,3 @@ while True:
         if i%5000==0:
             print(f"[{digital[i]},{eda_uS[i]},{ecg_mV[i]}]")
         time.sleep(0.001)
-
