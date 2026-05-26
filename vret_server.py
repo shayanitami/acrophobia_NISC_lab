@@ -88,11 +88,11 @@ def connect_to_opensignals():
     inlet=StreamInlet(opensignalstream) #here we make the connection and read the stream. TCP connection made
 
     if opensignalstream.channel_count()==2:
-        eda_channel=0
-        ecg_channel=1
-    elif opensignalstream.channel_count()==3:
         eda_channel=1
-        ecg_channel=2
+        ecg_channel=0
+    elif opensignalstream.channel_count()==3:
+        eda_channel=2
+        ecg_channel=1
 
     return [inlet,eda_channel,ecg_channel]
 
@@ -159,12 +159,10 @@ if __name__ == "__main__":
                     squared=rr_diffs**2
                     mean_sq=np.mean(squared)
                     rmssd_ms=np.sqrt(mean_sq)
-
-                if hr_bpm is not None:
+                if hr_bpm is not None and rmssd_ms is not None:
                     hr_buffer.append(hr_bpm)
-                if rmssd_ms is not None:
                     rmssd_buffer.append(rmssd_ms)
- 
+
         
         if tick%PRINT_INTERVAL==0:
 
@@ -261,7 +259,6 @@ if __name__ == "__main__":
     tick=0
     total_samples=0
     ecg_buffer = deque(maxlen=ECG_WINDOW_SAMPLES)
-
     start=time.time()
 
 
@@ -304,15 +301,27 @@ if __name__ == "__main__":
                     mean_sq=np.mean(squared)
                     rmssd_ms=np.sqrt(mean_sq)
 
+        if hr_bpm is not None and rmssd_ms is not None and eda_smoothed is not None:
+            delta_hr = (hr_bpm - avg_hr) / avg_hr * 100
+            delta_hrv = (avg_hrv-rmssd_ms) / avg_hrv * 100
+            delta_eda = (eda_smoothed - avg_eda) / avg_eda * 100
+        else:
+            delta_hr = None
+            delta_hrv = None
+            delta_eda = None
+
         if tick%PRINT_INTERVAL==0:
             if len(chunk)==0:
                 print("[LIVE] got 0 samples")
             else:
                 hr_str = f"{hr_bpm:.1f}" if hr_bpm is not None else "—"
                 rmssd_str = f"{rmssd_ms:.1f}" if rmssd_ms is not None else "—"
-                print(f"[LIVE] got {len(chunk)} samples| raw_EDA={sample[eda_ch]:.4f} | smoothed EDA={eda_smoothed:.4f} μS | HR={hr_str} BPM | RMSSD={rmssd_str} ms")
+                dhr_str = f"{delta_hr:+.1f}" if delta_hr is not None else "—"
+                dhrv_str = f"{delta_hrv:+.1f}" if delta_hrv is not None else "—"
+                deda_str = f"{delta_eda:+.1f}" if delta_eda is not None else "—"
+                print(f"[LIVE] got {len(chunk)} samples| raw_EDA={sample[eda_ch]:.4f} | smoothed EDA={eda_smoothed:.4f} μS | HR={hr_str} BPM | RMSSD={rmssd_str} ms | ΔHR={dhr_str}% | ΔHRV={dhrv_str}% | ΔEDA={deda_str}%")
 
-            
+        
         tick=tick+1
         time.sleep(LOOP_SLEEP_S)
 
@@ -322,4 +331,5 @@ if __name__ == "__main__":
     print(f"[LIVE] Total raw samples: {total_samples}")
     print(f"[LIVE] Effective rate: {total_samples / elapsed:.1f} Hz")
     print(f"[LIVE] ecg_buffer (deque): {len(ecg_buffer)} / {ECG_WINDOW_SAMPLES} samples")
+
 

@@ -11,7 +11,7 @@ info = StreamInfo(
             source_id='OpenSignals'
             )
 
-data=np.loadtxt(r"C:\Users\Shayan\Desktop\NICS\acrophobia\shayan_code\vret_pipeline\stage_3c_fake_opensignal_2026-05-13_15-30-08.txt",skiprows=3)
+data=np.loadtxt(r"C:\Users\Shayan\Desktop\NICS\acrophobia\shayan_code\vret_pipeline\paria_onmylaptop_opensignals_2026-05-25_15-13-39.txt",skiprows=3)
 outlet = StreamOutlet(info)
 rows,columns=data.shape
 print(rows)
