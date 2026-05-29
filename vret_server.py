@@ -27,6 +27,7 @@ ECG_MIN_SAMPLES_FOR_HR  = 5000              # don't try R-peak detection until b
 ECG_WINDOW_SAMPLES      = 10000             # R-peak detection window (~10 s at 1 kHz)
 HR_COMPUTE_INTERVAL     = 10                # compute HR every N ticks (10 → 5 Hz at 50 Hz loop)
 PRINT_INTERVAL          = 5                 # print every N ticks (5 → 10 Hz at 50 Hz loop)
+ECG_ROUGHNESS_MAX       = 0.0065
 RR_MIN_MS               = 300               # filter: ignore RR shorter than this (>200 BPM)
 RR_MAX_MS               = 1500              # filter: ignore RR longer than this (<40 BPM)
 RMSSD_WINDOW_BEATS      = 60                # how many recent RR intervals to use for RMSSD
@@ -134,31 +135,40 @@ if __name__ == "__main__":
                 eda_smoothed=EDA_ALPHA * sample[eda_ch] + (1 - EDA_ALPHA) * eda_smoothed 
             eda_smoothed_buffer.append(eda_smoothed)
 
-        if tick%HR_COMPUTE_INTERVAL==0:
+        if tick%HR_COMPUTE_INTERVAL == 0:
 
-            if len(ecg_buffer)>=ECG_MIN_SAMPLES_FOR_HR:
+            if len(ecg_buffer) >= ECG_MIN_SAMPLES_FOR_HR:
 
                 window=np.array(ecg_buffer[-ECG_WINDOW_SAMPLES:])
-                peaks,info=nk.ecg_peaks(window,sampling_rate=SAMPLING_RATE_HZ) #peaks we don't need. info is a dictionary with keys.one of them is ECG_R_Peaks.
-                r_peak_indices=info['ECG_R_Peaks'] 
-                rr_intervals_ms=np.diff(r_peak_indices)
-                valid_rr = (rr_intervals_ms >= RR_MIN_MS) & (rr_intervals_ms <=RR_MAX_MS)
-                rr_clean = rr_intervals_ms[valid_rr]
-               
-                if len(rr_clean) > 0:
-                    hr_bpm = 60000 / rr_clean[-1]
-
-                else:
-                    hr_bpm = None
-
-                #HRV    
-                if len(rr_clean)<2:
+                #filtering noise of ecg from cables touching the clothes
+                roughness = np.mean(np.abs(np.diff(window[-5000:])))
+                if roughness > ECG_ROUGHNESS_MAX:
+                    hr_bpm=None
                     rmssd_ms=None
                 else:
-                    rr_diffs=np.diff(rr_clean[-RMSSD_WINDOW_BEATS:]) #for hrv
-                    squared=rr_diffs**2
-                    mean_sq=np.mean(squared)
-                    rmssd_ms=np.sqrt(mean_sq)
+                    peaks,info=nk.ecg_peaks(window,sampling_rate=SAMPLING_RATE_HZ)
+                    r_peak_indices=info['ECG_R_Peaks']
+                    rr_intervals_ms=np.diff(r_peak_indices)
+                    valid_rr = (rr_intervals_ms >= RR_MIN_MS) & (rr_intervals_ms <=RR_MAX_MS)
+                    rr_clean = rr_intervals_ms[valid_rr]
+
+                        
+               
+               
+                    if len(rr_clean) > 0:
+                        hr_bpm = 60000 / rr_clean[-1]
+
+                    else:
+                        hr_bpm = None
+
+                #HRV    
+                    if len(rr_clean)<2:
+                        rmssd_ms=None
+                    else:
+                        rr_diffs=np.diff(rr_clean[-RMSSD_WINDOW_BEATS:]) #for hrv
+                        squared=rr_diffs**2
+                        mean_sq=np.mean(squared)
+                        rmssd_ms=np.sqrt(mean_sq)
                 if hr_bpm is not None and rmssd_ms is not None:
                     hr_buffer.append(hr_bpm)
                     rmssd_buffer.append(rmssd_ms)
@@ -273,33 +283,36 @@ if __name__ == "__main__":
                 eda_smoothed=sample[eda_ch]
             else:
                 eda_smoothed=EDA_ALPHA * sample[eda_ch] + (1 - EDA_ALPHA) * eda_smoothed 
-
-        
         if tick%HR_COMPUTE_INTERVAL==0:
 
             if len(ecg_buffer)>=ECG_MIN_SAMPLES_FOR_HR:
 
                 window=np.array(ecg_buffer)
-                peaks,info=nk.ecg_peaks(window,sampling_rate=SAMPLING_RATE_HZ) 
-                r_peak_indices=info['ECG_R_Peaks'] 
-                rr_intervals_ms=np.diff(r_peak_indices)
-                valid_rr = (rr_intervals_ms >= RR_MIN_MS) & (rr_intervals_ms <=RR_MAX_MS)
-                rr_clean = rr_intervals_ms[valid_rr]
-                   
-                if len(rr_clean) > 0:
-                    hr_bpm = 60000 / rr_clean[-1]
+                roughness = np.mean(np.abs(np.diff(window[-5000:])))
+                print(f"[DEBUG] roughness={roughness:.4f}")
 
-                else:
+                if roughness > ECG_ROUGHNESS_MAX:
                     hr_bpm = None
-
-                #HRV    
-                if len(rr_clean)<2:
-                    rmssd_ms=None
+                    rmssd_ms = None
                 else:
-                    rr_diffs=np.diff(rr_clean[-RMSSD_WINDOW_BEATS:]) #for hrv
-                    squared=rr_diffs**2
-                    mean_sq=np.mean(squared)
-                    rmssd_ms=np.sqrt(mean_sq)
+                    peaks,info=nk.ecg_peaks(window,sampling_rate=SAMPLING_RATE_HZ) 
+                    r_peak_indices=info['ECG_R_Peaks'] 
+                    rr_intervals_ms=np.diff(r_peak_indices)
+                    valid_rr = (rr_intervals_ms >= RR_MIN_MS) & (rr_intervals_ms <=RR_MAX_MS)
+                    rr_clean = rr_intervals_ms[valid_rr]
+                       
+                    if len(rr_clean) > 0:
+                        hr_bpm = 60000 / rr_clean[-1]
+                    else:
+                        hr_bpm = None
+
+                    if len(rr_clean)<2:
+                        rmssd_ms=None
+                    else:
+                        rr_diffs=np.diff(rr_clean[-RMSSD_WINDOW_BEATS:])
+                        squared=rr_diffs**2
+                        mean_sq=np.mean(squared)
+                        rmssd_ms=np.sqrt(mean_sq)
 
         if hr_bpm is not None and rmssd_ms is not None and eda_smoothed is not None:
             delta_hr = (hr_bpm - avg_hr) / avg_hr * 100
