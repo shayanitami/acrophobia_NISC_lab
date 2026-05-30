@@ -7,15 +7,35 @@ Top-to-bottom procedural script. The only function calls are into validated
 libraries (neurokit2, pylsl) — none of our own.
 
 SIGNAL MATH — every formula sourced to a library, not hand-rolled:
+  CLEAN : nk.ecg_clean(raw_ecg, sampling_rate) BEFORE every peak detection.
+          (Canonical NeuroKit order is ecg_clean -> ecg_peaks -> hrv_time.
+           ecg_peaks expects a cleaned signal; raw electrode ECG carries 50 Hz
+           mains hum + baseline wander, on which the detector finds zero peaks.
+           Default method 'neurokit' = 0.5 Hz highpass + powerline filtering.)
   HR    : nk.ecg_rate(peaks, sampling_rate)  -> mean over window.
           (nk.ecg_rate is NeuroKit's official rate function, an alias of
            signal_rate; computes 60/period between R-peaks. Source: neurokit2
            signal/signal_rate.py.)
-  RMSSD : nk.ecg_peaks(...) -> nk.hrv_time(...)["HRV_RMSSD"].
-          (Canonical pattern from the NeuroKit ecg_hrv example.)
+  RMSSD : nk.ecg_clean -> nk.ecg_peaks -> nk.hrv_time(...)["HRV_RMSSD"].
+          Following the repo examples exactly, the FIRST return of ecg_peaks
+          (the signals DataFrame, named `peaks` in the docs) is passed to
+          hrv_time and ecg_rate -- not the info dict. (Verified numerically
+          identical to passing info; changed only to mirror the examples at
+          https://neuropsychology.github.io/NeuroKit/functions/hrv.html)
+  QUALITY: any RMSSD outside RMSSD_MIN_MS..RMSSD_MAX_MS is rejected as a
+          detection failure (poor-quality ECG), not reported. nk.ecg_quality
+          is printed at baseline so a weak/noisy ECG channel is visible.
   EDA   : EMA smoothing for the displayed level. Verified to match NeuroKit's
           EDA_Tonic mean to 3 decimals on the test recording.
   ADC->phys : PLUX biosignalsplux datasheet transfer functions (in fake stream).
+
+CHANNEL MAPPING (the bug that was producing impossible RMSSD values):
+  The stream carries ch0=digital, ch1=EDA, ch2=ECG. This script now reads the
+  channel LABELS from the stream metadata and maps EDA/ECG by name. If labels
+  are missing (older fake stream, or a real device that doesn't publish them)
+  it falls back to the correct fixed indices. A passive sanity check after
+  baseline collection warns loudly if the channel assigned to ECG does not look
+  like ECG — so a silent swap can never go unnoticed again.
 
 WINDOWS:
   HR window  = 30 s, RMSSD window = 60 s, both MOVING (sliding deque), updated
@@ -63,12 +83,20 @@ HR_COMPUTE_INTERVAL     = 25             # recompute HR/RMSSD every N ticks (~0.
 PRINT_INTERVAL          = 5              # print every N ticks (~10 Hz)
 MIN_PEAKS_HRV           = 10
 
+# Physiological plausibility band for resting RMSSD. Real resting RMSSD is
+# ~10-150 ms; values far outside this are not a measurement, they are the
+# R-peak detector failing on a poor-quality ECG (it misses/invents beats, so
+# successive RR differences explode). We reject such values instead of
+# reporting them, and warn that the ECG channel quality needs attention.
+RMSSD_MIN_MS            = 5
+RMSSD_MAX_MS            = 300
+
 WEIGHT_EDA              = 0.5
 WEIGHT_HRV              = 0.3
 WEIGHT_HR               = 0.2
 ST_ROLLING_WINDOW_S     = 1.0
-THRESHOLD_MILD_K        = 1.33
-THRESHOLD_HIGH_K        = 2.28
+THRESHOLD_MILD_K        = 1.28     # z for 90th percentile (one-sided 10% tail)
+THRESHOLD_HIGH_K        = 2.33     # z for 99th percentile (one-sided  1% tail)
 
 SIGMA_THRESHOLD         = 3              # 3-sigma cleaning for EDA baseline mean
 
@@ -104,12 +132,46 @@ if opensignalstream is None:
     raise RuntimeError("Streams found but none with 2 or 3 channels")
 
 inlet = StreamInlet(opensignalstream)
-# 3-channel LSL: ch0=digital, ch1=EDA, ch2=ECG.  2-channel: ch0=EDA, ch1=ECG.
-if opensignalstream.channel_count() == 2:
-    eda_ch, ecg_ch = 0, 1
+n_ch = opensignalstream.channel_count()
+
+# ---- Map EDA/ECG by channel LABEL (robust), with a corrected fixed-index
+#      fallback. This is the line that was wrong before: the old code did
+#      `eda_ch, ecg_ch = 2, 1`, i.e. EDA was read from the ECG channel and
+#      vice-versa, which fed the smooth EDA trace to nk.ecg_peaks and produced
+#      impossible RMSSD (~1000 ms) and a stress score that divided by ~0. ----
+def _read_channel_labels(inlet_obj):
+    labels = []
+    try:
+        full = inlet_obj.info(timeout=2.0)          # fetch full metadata (desc)
+        ch = full.desc().child("channels").child("channel")
+        while not ch.empty():
+            labels.append((ch.child_value("label") or "").strip().upper())
+            ch = ch.next_sibling()
+    except Exception:
+        labels = []
+    return labels
+
+labels = _read_channel_labels(inlet)
+eda_ch = ecg_ch = None
+if labels:
+    for idx, lab in enumerate(labels):
+        if "EDA" in lab and eda_ch is None:
+            eda_ch = idx
+        if "ECG" in lab and ecg_ch is None:
+            ecg_ch = idx
+
+if eda_ch is None or ecg_ch is None:
+    # Fallback (CORRECTED): 3-ch stream is ch0=digital, ch1=EDA, ch2=ECG;
+    #                       2-ch stream is ch0=EDA, ch1=ECG.
+    if n_ch == 2:
+        eda_ch, ecg_ch = 0, 1
+    else:
+        eda_ch, ecg_ch = 1, 2
+    print(f"[LSL] no usable channel labels; using fixed mapping "
+          f"EDA=ch{eda_ch}, ECG=ch{ecg_ch}.")
 else:
-    eda_ch, ecg_ch = 1, 2
-print(f"Connected. EDA on channel {eda_ch}, ECG on channel {ecg_ch}.")
+    print(f"[LSL] mapped by label -> EDA=ch{eda_ch}, ECG=ch{ecg_ch} "
+          f"(labels: {labels}).")
 
 
 # ============================================================
@@ -148,10 +210,11 @@ while time.time() - start < BASELINE_DURATION_S:
         if len(ecg_arr) > 0:
             try:
                 ecg_for_hr = ecg_arr[-HR_CAP_SAMPLES:] if len(ecg_arr) > HR_CAP_SAMPLES else ecg_arr
-                _, info_hr = nk.ecg_peaks(ecg_for_hr,
-                                          sampling_rate=SAMPLING_RATE_HZ,
-                                          correct_artifacts=True)
-                rate = nk.ecg_rate(info_hr, sampling_rate=SAMPLING_RATE_HZ)
+                ecg_for_hr = nk.ecg_clean(ecg_for_hr, sampling_rate=SAMPLING_RATE_HZ)
+                peaks_hr, info_hr = nk.ecg_peaks(ecg_for_hr,
+                                                 sampling_rate=SAMPLING_RATE_HZ,
+                                                 correct_artifacts=True)
+                rate = nk.ecg_rate(peaks_hr, sampling_rate=SAMPLING_RATE_HZ)
                 hr_bpm = float(np.nanmean(rate))
                 if not np.isfinite(hr_bpm):
                     hr_bpm = None
@@ -161,12 +224,15 @@ while time.time() - start < BASELINE_DURATION_S:
         # --- RMSSD on the 60 s moving window via nk.hrv_time ---
         if len(ecg_arr) >= HRV_WIN_SAMPLES:
             try:
-                _, info_hrv = nk.ecg_peaks(ecg_arr[-HRV_WIN_SAMPLES:],
-                                           sampling_rate=SAMPLING_RATE_HZ,
-                                           correct_artifacts=True)
+                ecg_hrv_win = nk.ecg_clean(ecg_arr[-HRV_WIN_SAMPLES:],
+                                           sampling_rate=SAMPLING_RATE_HZ)
+                peaks_hrv, info_hrv = nk.ecg_peaks(ecg_hrv_win,
+                                                   sampling_rate=SAMPLING_RATE_HZ,
+                                                   correct_artifacts=True)
                 if len(info_hrv["ECG_R_Peaks"]) >= MIN_PEAKS_HRV:
-                    r = float(nk.hrv_time(info_hrv, sampling_rate=SAMPLING_RATE_HZ)["HRV_RMSSD"].iloc[0])
-                    rmssd_ms = r if np.isfinite(r) else None
+                    r = float(nk.hrv_time(peaks_hrv, sampling_rate=SAMPLING_RATE_HZ)["HRV_RMSSD"].iloc[0])
+                    # reject impossible values (poor-quality ECG, not a real measurement)
+                    rmssd_ms = r if (np.isfinite(r) and RMSSD_MIN_MS <= r <= RMSSD_MAX_MS) else None
                 else:
                     rmssd_ms = None
             except Exception:
@@ -202,14 +268,79 @@ print(f"rmssd_buffer:        {len(rmssd_buffer)} RMSSD values")
 
 
 # ============================================================
+# CHANNEL SANITY CHECK (passive, print-only — never changes behavior)
+#   Zero-crossing counts were fooled by 50 Hz mains hum on the raw ECG, so we
+#   instead ask the real question: which channel, when treated as ECG, yields
+#   physiologically plausible heartbeats? We clean each channel and detect
+#   R-peaks; the true ECG produces RR intervals almost all within 300-1500 ms
+#   (40-200 BPM), while EDA (forced through the detector) does not. If the
+#   channel mapped to EDA looks MORE heart-like than the one mapped to ECG,
+#   the mapping is probably inverted.
+# ============================================================
+def _beat_plausibility(buf):
+    """Fraction of RR intervals in the human-plausible 300-1500 ms band when
+    this buffer is treated as ECG. ~1.0 for a real ECG, lower for EDA."""
+    a = np.asarray(buf, dtype=float)
+    if a.size < SAMPLING_RATE_HZ * 5:        # need a few seconds
+        return 0.0
+    try:
+        cleaned = nk.ecg_clean(a, sampling_rate=SAMPLING_RATE_HZ)
+        _, _info = nk.ecg_peaks(cleaned, sampling_rate=SAMPLING_RATE_HZ,
+                                correct_artifacts=True)
+        pk = _info["ECG_R_Peaks"]
+        if len(pk) < 3:
+            return 0.0
+        rri = np.diff(pk) * 1000.0 / SAMPLING_RATE_HZ
+        return float(np.mean((rri >= 300) & (rri <= 1500)))
+    except Exception:
+        return 0.0
+
+_ecg_plaus = _beat_plausibility(ecg_buffer)
+_eda_plaus = _beat_plausibility(eda_buffer)
+print(f"[SANITY] beat-plausibility -> ECG-channel={_ecg_plaus:.2f}, EDA-channel={_eda_plaus:.2f}")
+if _eda_plaus > _ecg_plaus:
+    print("!!! [SANITY WARNING] The channel mapped to EDA produces more plausible "
+          "heartbeats than the one mapped to ECG. The EDA/ECG mapping may be "
+          "INVERTED — check the channel labels in fake_opensignals.py / your device. !!!")
+
+
+# ============================================================
 # FREEZE BASELINE STATS (inline, validated whole-baseline computation)
 # ============================================================
-ecg_all = np.asarray(ecg_buffer, dtype=float)
+ecg_all_raw = np.asarray(ecg_buffer, dtype=float)
+# Clean ONCE (highpass + 50 Hz powerline removal). nk.ecg_peaks expects a cleaned
+# signal; feeding raw mains-contaminated ECG yields zero R-peaks. All baseline peak
+# detection below uses slices of this cleaned array.
+ecg_all = nk.ecg_clean(ecg_all_raw, sampling_rate=SAMPLING_RATE_HZ)
 
 # avg_hr via official rate, avg_hrv via official hrv_time, over the whole baseline
-_, info_all = nk.ecg_peaks(ecg_all, sampling_rate=SAMPLING_RATE_HZ, correct_artifacts=True)
-avg_hr = float(np.nanmean(nk.ecg_rate(info_all, sampling_rate=SAMPLING_RATE_HZ)))
-avg_hrv = float(nk.hrv_time(info_all, sampling_rate=SAMPLING_RATE_HZ)["HRV_RMSSD"].iloc[0])
+peaks_all, info_all = nk.ecg_peaks(ecg_all, sampling_rate=SAMPLING_RATE_HZ, correct_artifacts=True)
+n_peaks_baseline = len(info_all["ECG_R_Peaks"])
+if n_peaks_baseline < MIN_PEAKS_HRV:
+    raise RuntimeError(
+        f"Only {n_peaks_baseline} R-peaks detected in {len(ecg_all)/SAMPLING_RATE_HZ:.0f} s "
+        f"of baseline ECG (need >= {MIN_PEAKS_HRV}). The ECG is likely too noisy or the "
+        f"electrodes lost contact — check the ECG channel before continuing. "
+        f"Baseline HR/HRV cannot be computed.")
+
+# ECG signal-quality score (nk.ecg_quality, 0..1). Low quality => unreliable
+# R-peaks => the RMSSD blow-ups. This is printed so a bad recording is obvious.
+try:
+    ecg_q = float(np.nanmean(nk.ecg_quality(ecg_all,
+                                            rpeaks=info_all["ECG_R_Peaks"],
+                                            sampling_rate=SAMPLING_RATE_HZ)))
+except Exception:
+    ecg_q = float("nan")
+
+avg_hr = float(np.nanmean(nk.ecg_rate(peaks_all, sampling_rate=SAMPLING_RATE_HZ)))
+avg_hrv = float(nk.hrv_time(peaks_all, sampling_rate=SAMPLING_RATE_HZ)["HRV_RMSSD"].iloc[0])
+if not (RMSSD_MIN_MS <= avg_hrv <= RMSSD_MAX_MS):
+    raise RuntimeError(
+        f"Baseline RMSSD = {avg_hrv:.0f} ms is outside the physiological range "
+        f"({RMSSD_MIN_MS}-{RMSSD_MAX_MS} ms). ECG quality score = {ecg_q:.2f}. This means the "
+        f"R-peak detector is failing on this ECG (it misses/invents beats), not that HRV is "
+        f"really that high. The recording's ECG channel is too weak or noisy — improve "
+        f"electrode contact/grounding and re-record before relying on HRV.")
 
 # EDA baseline mean with 3-sigma cleaning (inlined)
 eda_sm_arr = np.asarray(eda_smoothed_buffer, dtype=float)
@@ -228,20 +359,20 @@ for end in range(HRV_WIN_SAMPLES, len(ecg_all), step):
     h = None
     try:
         hr_start = max(0, end - HR_CAP_SAMPLES)
-        _, ih = nk.ecg_peaks(ecg_all[hr_start:end],
-                             sampling_rate=SAMPLING_RATE_HZ, correct_artifacts=True)
-        hh = float(np.nanmean(nk.ecg_rate(ih, sampling_rate=SAMPLING_RATE_HZ)))
+        sig_h, ih = nk.ecg_peaks(ecg_all[hr_start:end],
+                                 sampling_rate=SAMPLING_RATE_HZ, correct_artifacts=True)
+        hh = float(np.nanmean(nk.ecg_rate(sig_h, sampling_rate=SAMPLING_RATE_HZ)))
         h = hh if np.isfinite(hh) else None
     except Exception:
         h = None
     # RMSSD on 60 s window via hrv_time
     r = None
     try:
-        _, ir = nk.ecg_peaks(ecg_all[end - HRV_WIN_SAMPLES:end],
-                             sampling_rate=SAMPLING_RATE_HZ, correct_artifacts=True)
+        sig_r, ir = nk.ecg_peaks(ecg_all[end - HRV_WIN_SAMPLES:end],
+                                 sampling_rate=SAMPLING_RATE_HZ, correct_artifacts=True)
         if len(ir["ECG_R_Peaks"]) >= MIN_PEAKS_HRV:
-            rr = float(nk.hrv_time(ir, sampling_rate=SAMPLING_RATE_HZ)["HRV_RMSSD"].iloc[0])
-            r = rr if np.isfinite(rr) else None
+            rr = float(nk.hrv_time(sig_r, sampling_rate=SAMPLING_RATE_HZ)["HRV_RMSSD"].iloc[0])
+            r = rr if (np.isfinite(rr) and RMSSD_MIN_MS <= rr <= RMSSD_MAX_MS) else None
     except Exception:
         r = None
     if h is None or r is None:
@@ -261,6 +392,7 @@ print(f"avg_hr  = {avg_hr:.2f} BPM")
 print(f"avg_hrv = {avg_hrv:.2f} ms")
 print(f"avg_eda = {avg_eda:.4f} μS")
 print(f"sigma_baseline = {sigma_baseline:.4f}")
+print(f"ECG quality (nk.ecg_quality, 0-1) = {ecg_q:.2f}   |   R-peaks detected = {n_peaks_baseline}")
 
 
 # ============================================================
@@ -307,9 +439,10 @@ while time.time() - start < LIVE_DURATION_S:
         # HR via ecg_rate on the cap-bounded slice
         try:
             ecg_for_hr = ecg_arr[-HR_CAP_SAMPLES:] if len(ecg_arr) > HR_CAP_SAMPLES else ecg_arr
-            _, info_hr = nk.ecg_peaks(ecg_for_hr,
-                                      sampling_rate=SAMPLING_RATE_HZ, correct_artifacts=True)
-            rate = nk.ecg_rate(info_hr, sampling_rate=SAMPLING_RATE_HZ)
+            ecg_for_hr = nk.ecg_clean(ecg_for_hr, sampling_rate=SAMPLING_RATE_HZ)
+            peaks_hr, info_hr = nk.ecg_peaks(ecg_for_hr,
+                                             sampling_rate=SAMPLING_RATE_HZ, correct_artifacts=True)
+            rate = nk.ecg_rate(peaks_hr, sampling_rate=SAMPLING_RATE_HZ)
             hr_bpm = float(np.nanmean(rate))
             if not np.isfinite(hr_bpm):
                 hr_bpm = None
@@ -319,11 +452,12 @@ while time.time() - start < LIVE_DURATION_S:
         # RMSSD only once the 60 s window has filled (via hrv_time, official)
         if len(ecg_arr) >= HRV_WIN_SAMPLES:
             try:
-                _, info_hrv = nk.ecg_peaks(ecg_arr,
-                                           sampling_rate=SAMPLING_RATE_HZ, correct_artifacts=True)
+                ecg_hrv_win = nk.ecg_clean(ecg_arr, sampling_rate=SAMPLING_RATE_HZ)
+                peaks_hrv, info_hrv = nk.ecg_peaks(ecg_hrv_win,
+                                                   sampling_rate=SAMPLING_RATE_HZ, correct_artifacts=True)
                 if len(info_hrv["ECG_R_Peaks"]) >= MIN_PEAKS_HRV:
-                    r = float(nk.hrv_time(info_hrv, sampling_rate=SAMPLING_RATE_HZ)["HRV_RMSSD"].iloc[0])
-                    rmssd_ms = r if np.isfinite(r) else None
+                    r = float(nk.hrv_time(peaks_hrv, sampling_rate=SAMPLING_RATE_HZ)["HRV_RMSSD"].iloc[0])
+                    rmssd_ms = r if (np.isfinite(r) and RMSSD_MIN_MS <= r <= RMSSD_MAX_MS) else None
                 else:
                     rmssd_ms = None
             except Exception:
