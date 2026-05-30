@@ -98,10 +98,47 @@ ST_ROLLING_WINDOW_S     = 1.0
 THRESHOLD_MILD_K        = 1.28     # z for 90th percentile (one-sided 10% tail)
 THRESHOLD_HIGH_K        = 2.33     # z for 99th percentile (one-sided  1% tail)
 
+# ---- EDA tonic/phasic decomposition + per-signal z-scoring ----
+# Raw EDA is dominated by slow tonic drift (electrode hydration, temperature),
+# which on test data was ~99% of EDA variance and pinned the score to
+# "ultra-stressed". We instead decompose EDA into tonic (SCL) + phasic (SCR)
+# and feed only the PHASIC component (event-driven sympathetic responses) into
+# the score. Because phasic EDA is in uS while HR/HRV deltas are in %, we put
+# all three signals on a common scale by z-scoring each against ITS OWN baseline
+# spread before applying the 0.5/0.3/0.2 weights — so the weights express
+# relative importance, not an accident of which signal has bigger raw numbers.
+EDA_DECOMP_RATE_HZ      = 10       # nk.eda_phasic runs at a low rate; 10 Hz is plenty
+EDA_DECOMP_WINDOW_S     = 60       # rolling EDA window handed to nk.eda_phasic each update
+EDA_DECOMP_WIN_SAMPLES  = EDA_DECOMP_WINDOW_S * SAMPLING_RATE_HZ
+SIGMA_FLOOR             = 1e-6     # guard against divide-by-zero in z-scoring
+
 SIGMA_THRESHOLD         = 3              # 3-sigma cleaning for EDA baseline mean
 
 HR_CAP_SAMPLES          = HR_BUFFER_CAP_S * SAMPLING_RATE_HZ
 HRV_WIN_SAMPLES         = HRV_WINDOW_S * SAMPLING_RATE_HZ
+
+
+def compute_phasic_eda(raw_eda_window, src_rate=SAMPLING_RATE_HZ):
+    """Decompose a raw EDA window into its phasic (SCR) component and return the
+    LAST phasic value (the current event-driven response, tonic drift removed).
+
+    Resamples to EDA_DECOMP_RATE_HZ, cleans, runs nk.eda_phasic, returns the
+    final phasic sample in uS. Returns 0.0 if the window is too short or the
+    decomposition fails (0.0 = "no phasic deviation", the safe neutral value).
+    """
+    a = np.asarray(raw_eda_window, dtype=float)
+    if a.size < src_rate * 5:          # need a few seconds to decompose
+        return 0.0
+    try:
+        ds = nk.signal_resample(a, sampling_rate=src_rate,
+                                desired_sampling_rate=EDA_DECOMP_RATE_HZ)
+        ds = nk.eda_clean(ds, sampling_rate=EDA_DECOMP_RATE_HZ)
+        phasic = nk.eda_phasic(ds, sampling_rate=EDA_DECOMP_RATE_HZ)["EDA_Phasic"].values
+        if phasic.size == 0:
+            return 0.0
+        return float(phasic[-1])
+    except Exception:
+        return 0.0
 
 
 # ============================================================
@@ -349,17 +386,41 @@ sd = eda_sm_arr.std()
 eda_cleaned = eda_sm_arr[np.abs(eda_sm_arr - mu) <= SIGMA_THRESHOLD * sd]
 avg_eda = eda_cleaned.mean()
 
-# sigma_baseline: slide the live windows across the baseline (inline)
+# EDA baseline: decompose the whole baseline EDA into its phasic component once,
+# at the decomposition rate. We index this per sweep-window (and freeze its mean
+# and sigma) so the live phase z-scores against the same phasic-EDA baseline.
+eda_raw_arr = np.asarray(eda_buffer, dtype=float)
+try:
+    _eda_ds = nk.eda_clean(
+        nk.signal_resample(eda_raw_arr, sampling_rate=SAMPLING_RATE_HZ,
+                           desired_sampling_rate=EDA_DECOMP_RATE_HZ),
+        sampling_rate=EDA_DECOMP_RATE_HZ)
+    eda_phasic_baseline = nk.eda_phasic(_eda_ds, sampling_rate=EDA_DECOMP_RATE_HZ)["EDA_Phasic"].values
+except Exception:
+    eda_phasic_baseline = np.zeros(int(len(eda_raw_arr) * EDA_DECOMP_RATE_HZ / SAMPLING_RATE_HZ))
+
+def _phasic_at_sample(end_sample):
+    """Phasic EDA value corresponding to ECG sample index `end_sample`."""
+    if eda_phasic_baseline.size == 0:
+        return 0.0
+    pi = int(end_sample * EDA_DECOMP_RATE_HZ / SAMPLING_RATE_HZ) - 1
+    return float(eda_phasic_baseline[min(max(pi, 0), eda_phasic_baseline.size - 1)])
+
+# Pass 1: sweep the baseline, collecting each signal's RAW per-window quantity:
+#   - EDA: phasic amplitude (uS), tonic-free
+#   - HR : percent deviation from avg_hr
+#   - HRV: percent deviation from avg_hrv (inverted; low HRV = stress)
+# We need each signal's own baseline mean & sigma to z-score it later.
 rolling = int(ST_ROLLING_WINDOW_S * LOOP_RATE_HZ)
 step = SAMPLING_RATE_HZ // 2
-s_t_buf = deque(maxlen=rolling)
-s_t_history = []
-_sweep_total = 0          # how many window positions we attempted
-_sweep_dropped_hr = 0     # discarded because HR could not be computed
-_sweep_dropped_rmssd = 0  # discarded because RMSSD invalid/unavailable
+_raw_eda_d = []
+_raw_hr_d  = []
+_raw_hrv_d = []
+_sweep_total = 0
+_sweep_dropped_hr = 0
+_sweep_dropped_rmssd = 0
 for end in range(HRV_WIN_SAMPLES, len(ecg_all), step):
     _sweep_total += 1
-    # HR via ecg_rate on the cap-bounded slice ending at `end`
     h = None
     try:
         hr_start = max(0, end - HR_CAP_SAMPLES)
@@ -369,7 +430,6 @@ for end in range(HRV_WIN_SAMPLES, len(ecg_all), step):
         h = hh if np.isfinite(hh) else None
     except Exception:
         h = None
-    # RMSSD on 60 s window via hrv_time
     r = None
     try:
         sig_r, ir = nk.ecg_peaks(ecg_all[end - HRV_WIN_SAMPLES:end],
@@ -385,25 +445,65 @@ for end in range(HRV_WIN_SAMPLES, len(ecg_all), step):
         _sweep_dropped_rmssd += 1
     if h is None or r is None:
         continue
-    e_idx = int(end * len(eda_sm_arr) / len(ecg_all)) - 1
-    e = eda_sm_arr[min(e_idx, len(eda_sm_arr) - 1)]
-    d_eda = (e - avg_eda) / avg_eda * 100
-    d_hr  = (h - avg_hr) / avg_hr * 100
-    d_hrv = (avg_hrv - r) / avg_hrv * 100          # inverted: low HRV = stress
-    s_inst = WEIGHT_EDA * d_eda + WEIGHT_HRV * d_hrv + WEIGHT_HR * d_hr
-    s_t_buf.append(s_inst)
-    s_t_history.append(np.mean(s_t_buf))
+    _raw_eda_d.append(_phasic_at_sample(end))          # phasic uS
+    _raw_hr_d.append((h - avg_hr) / avg_hr * 100)       # HR %
+    _raw_hrv_d.append((avg_hrv - r) / avg_hrv * 100)    # HRV % (inverted)
 
-# Baseline S_t distribution. We need BOTH its mean and its spread: the live
-# thresholds are placed at (mean + K*sigma), i.e. the K-th z-score of the
-# participant's own resting S_t — not K*sigma above an assumed zero. Baseline
-# S_t is generally NOT centred at zero (e.g. EDA tends to drift upward during
-# rest), so comparing against 0 + K*sigma would flag a resting participant.
+_raw_eda_d = np.asarray(_raw_eda_d)
+_raw_hr_d  = np.asarray(_raw_hr_d)
+_raw_hrv_d = np.asarray(_raw_hrv_d)
+
+# Per-signal baseline mean & sigma (the "natural height" of each signal). These
+# are FROZEN and used to z-score live deltas: z = (delta - mean) / sigma.
+if _raw_eda_d.size:
+    eda_mean, eda_sigma = float(_raw_eda_d.mean()), float(_raw_eda_d.std())
+    hr_mean,  hr_sigma  = float(_raw_hr_d.mean()),  float(_raw_hr_d.std())
+    hrv_mean, hrv_sigma = float(_raw_hrv_d.mean()), float(_raw_hrv_d.std())
+else:
+    eda_mean = eda_sigma = hr_mean = hr_sigma = hrv_mean = hrv_sigma = 0.0
+eda_sigma = max(eda_sigma, SIGMA_FLOOR)
+hr_sigma  = max(hr_sigma,  SIGMA_FLOOR)
+hrv_sigma = max(hrv_sigma, SIGMA_FLOOR)
+
+
+def zscore_s_t(eda_phasic_v, hr_pct, hrv_pct):
+    """Composite stress score from z-scored, weighted signal deltas.
+    Each signal is expressed in units of ITS OWN baseline spread before the
+    0.5/0.3/0.2 weights are applied, so EDA's larger raw magnitude can no
+    longer dominate purely by scale."""
+    zE = (eda_phasic_v - eda_mean) / eda_sigma
+    zH = (hr_pct       - hr_mean)  / hr_sigma
+    zV = (hrv_pct      - hrv_mean) / hrv_sigma
+    return WEIGHT_EDA * zE + WEIGHT_HRV * zV + WEIGHT_HR * zH
+
+# Pass 2: build the baseline S_t distribution from z-scored values, so the
+# thresholds are on the same z-scored scale the live phase will use.
+s_t_buf = deque(maxlen=rolling)
+s_t_history = []
+s_inst_history = []
+for ev, hv, vv in zip(_raw_eda_d, _raw_hr_d, _raw_hrv_d):
+    s_inst = zscore_s_t(ev, hv, vv)
+    s_t_buf.append(s_inst)
+    s_t_history.append(np.mean(s_t_buf))   # smoothed (matches what live phase classifies)
+    s_inst_history.append(s_inst)          # raw instantaneous (true spread)
+
+# Baseline S_t distribution. The live phase classifies the SMOOTHED rolling-mean
+# S_t, so we centre the thresholds on the smoothed baseline MEAN. But the rolling
+# mean drastically shrinks variance (std of an average is ~std/sqrt(N) of the
+# underlying values), so using the smoothed std as sigma makes the bands far too
+# tight — the score then leaps straight past "stressed" into "ultra-stressed" the
+# moment any real arousal appears. We therefore take SIGMA from the RAW
+# instantaneous s_inst values (their true spread), while keeping the MEAN from the
+# smoothed series for centering. sigma_smoothed is computed too, for visibility.
 if s_t_history:
-    mean_baseline = float(np.mean(s_t_history))
-    sigma_baseline = float(np.std(s_t_history))
+    mean_baseline   = float(np.mean(s_t_history))      # centering: smoothed mean
+    sigma_smoothed  = float(np.std(s_t_history))        # deflated (for reference only)
+    sigma_raw       = float(np.std(s_inst_history))     # true spread of the score
+    sigma_baseline  = sigma_raw                          # <-- used for thresholds
 else:
     mean_baseline = 0.0
+    sigma_smoothed = 1.0
+    sigma_raw = 1.0
     sigma_baseline = 1.0
 
 # Guard against a degenerate baseline sweep. If almost no windows survived,
@@ -419,7 +519,12 @@ print(f"\n=== Frozen baseline averages ===")
 print(f"avg_hr  = {avg_hr:.2f} BPM")
 print(f"avg_hrv = {avg_hrv:.2f} ms")
 print(f"avg_eda = {avg_eda:.4f} μS")
-print(f"baseline S_t: mean = {mean_baseline:+.4f}, sigma = {sigma_baseline:.4f}")
+print(f"per-signal baseline (for z-scoring):")
+print(f"  EDA phasic: mean={eda_mean:+.4f} uS,  sigma={eda_sigma:.4f} uS")
+print(f"  HR  delta : mean={hr_mean:+.2f}%,  sigma={hr_sigma:.2f}%")
+print(f"  HRV delta : mean={hrv_mean:+.2f}%,  sigma={hrv_sigma:.2f}%")
+print(f"baseline S_t: mean = {mean_baseline:+.4f}, sigma_raw = {sigma_raw:.4f} "
+      f"(used), sigma_smoothed = {sigma_smoothed:.4f}")
 print(f"baseline sweep: {_valid} valid / {_sweep_total} windows "
       f"(dropped: HR={_sweep_dropped_hr}, RMSSD={_sweep_dropped_rmssd})")
 print(f"ECG quality (nk.ecg_quality, 0-1) = {ecg_q:.2f}   |   R-peaks detected = {n_peaks_baseline}")
@@ -441,15 +546,17 @@ print(f"total amount of {total_drained} samples were drained from the buffers "
 
 # state reset
 del eda_buffer, eda_smoothed_buffer, hr_buffer, rmssd_buffer, ecg_buffer
-eda_smoothed = avg_eda          # seed EMA at baseline level so ΔEDA starts near 0, not a bootstrap spike
+eda_smoothed = avg_eda          # seed EMA at baseline level so displayed EDA starts near baseline
+phasic_eda = 0.0                # current phasic EDA (uS); 0 = no deviation
 hr_bpm = None
 rmssd_ms = None
 delta_hr = None
 delta_hrv = None
-delta_eda = None
+delta_eda = None                # now carries the PHASIC EDA value (uS), not a percent
 tick = 0
 total_samples = 0
 ecg_buffer = deque(maxlen=HRV_WIN_SAMPLES)
+eda_raw_live = deque(maxlen=EDA_DECOMP_WIN_SAMPLES)   # rolling raw EDA for decomposition
 s_t_buf = deque(maxlen=rolling)
 thresh_mild = mean_baseline + THRESHOLD_MILD_K * sigma_baseline
 thresh_high = mean_baseline + THRESHOLD_HIGH_K * sigma_baseline
@@ -461,10 +568,14 @@ while time.time() - start < LIVE_DURATION_S:
 
     for sample in chunk:
         ecg_buffer.append(sample[ecg_ch])
+        eda_raw_live.append(sample[eda_ch])
         eda_smoothed = EDA_ALPHA * sample[eda_ch] + (1 - EDA_ALPHA) * eda_smoothed
 
     if tick % HR_COMPUTE_INTERVAL == 0 and len(ecg_buffer) > 0:
         ecg_arr = np.asarray(ecg_buffer, dtype=float)
+
+        # Phasic EDA on the rolling raw-EDA window (tonic drift removed).
+        phasic_eda = compute_phasic_eda(eda_raw_live, src_rate=SAMPLING_RATE_HZ)
 
         # HR via ecg_rate on the cap-bounded slice
         try:
@@ -493,45 +604,44 @@ while time.time() - start < LIVE_DURATION_S:
             except Exception:
                 rmssd_ms = None
 
-    # --- deltas ---
+    # --- deltas (raw, per-signal; z-scoring happens in the composition) ---
+    #   EDA: phasic amplitude in uS (tonic-free). Its baseline mean ~0, so the
+    #        z-score (phasic - eda_mean)/eda_sigma measures how large the current
+    #        event-driven response is relative to resting phasic activity.
+    #   HR / HRV: percent deviation from the frozen baseline averages.
+    delta_eda = phasic_eda                                   # uS (phasic)
     delta_hr  = (hr_bpm - avg_hr) / avg_hr * 100 if hr_bpm is not None else None
-    delta_eda = (eda_smoothed - avg_eda) / avg_eda * 100
     # HRV bootstrap: for the first ~60 s of live the RMSSD window has not yet
-    # filled, so no live RMSSD exists. Rather than renormalising the S_t weights
-    # (which would silently change the score's scale, and therefore the meaning
-    # of the sigma-baseline thresholds), we hold delta_hrv at 0 — i.e. assume HRV
-    # has not yet moved from its frozen baseline avg_hrv. The HRV term stays in
-    # the formula with its full 0.3 weight, contributing nothing until we have a
-    # real measurement. We deliberately do NOT slide the baseline RMSSD window
-    # across the operator gap, since that interval is of unknown length and would
-    # contaminate the estimate. Once the live window fills, delta_hrv switches to
-    # the genuine deviation.
+    # filled, so no live RMSSD exists. We hold delta_hrv at its baseline mean
+    # (hrv_mean) so its z-score is ~0 — i.e. assume HRV has not moved from
+    # baseline yet. The HRV term keeps its full 0.3 weight, contributing nothing
+    # until a real measurement arrives. We do NOT slide the baseline RMSSD window
+    # across the operator gap (unknown duration would contaminate it).
     if rmssd_ms is not None:
         delta_hrv = (avg_hrv - rmssd_ms) / avg_hrv * 100
     else:
-        delta_hrv = 0.0   # frozen-baseline stand-in (current_hrv == avg_hrv)
+        delta_hrv = hrv_mean   # z-scores to ~0: no assumed deviation yet
 
-    # --- composite stress score ---
-    #   Weights are FIXED at their study-defined values (EDA 0.5, HRV 0.3,
-    #   HR 0.2). delta_hrv is always present (0.0 during the first-60s bootstrap,
-    #   real thereafter), so the only term that can be briefly missing is HR, in
-    #   the first few seconds before any beats are detected. While HR is missing
-    #   we renormalise across the available terms so the score stays on the same
-    #   scale; once HR is present (within seconds) all three terms are active and
-    #   no renormalisation happens.
+    # --- composite stress score (per-signal z-scored, then weighted) ---
+    #   Each signal's delta is converted to its own baseline z-score before the
+    #   fixed 0.5/0.3/0.2 weights are applied, so EDA can no longer dominate by
+    #   raw scale. delta_hrv is always present (baseline-mean during bootstrap,
+    #   real after), so the only term that can be briefly missing is HR in the
+    #   first seconds. While HR is missing we renormalise across the available
+    #   z-scored terms so the score keeps the same scale.
     s_t = None
     state = "calm"
     unity_cmd = "increase"
     terms = []
     if delta_eda is not None:
-        terms.append((WEIGHT_EDA, delta_eda))
+        terms.append((WEIGHT_EDA, (delta_eda - eda_mean) / eda_sigma))
     if delta_hrv is not None:
-        terms.append((WEIGHT_HRV, delta_hrv))
+        terms.append((WEIGHT_HRV, (delta_hrv - hrv_mean) / hrv_sigma))
     if delta_hr is not None:
-        terms.append((WEIGHT_HR, delta_hr))
+        terms.append((WEIGHT_HR, (delta_hr - hr_mean) / hr_sigma))
     if terms:
         wsum = sum(w for w, _ in terms)
-        s_inst = sum(w * d for w, d in terms) / wsum * (WEIGHT_EDA + WEIGHT_HRV + WEIGHT_HR)
+        s_inst = sum(w * z for w, z in terms) / wsum * (WEIGHT_EDA + WEIGHT_HRV + WEIGHT_HR)
         s_t_buf.append(s_inst)
         s_t = float(np.mean(s_t_buf))
 
@@ -560,12 +670,12 @@ while time.time() - start < LIVE_DURATION_S:
             rmssd_str = f"{rmssd_ms:.1f}" if rmssd_ms is not None else "—"
             dhr_str = f"{delta_hr:+.1f}" if delta_hr is not None else "—"
             dhrv_str = f"{delta_hrv:+.1f}" if delta_hrv is not None else "—"
-            deda_str = f"{delta_eda:+.1f}" if delta_eda is not None else "—"
-            st_str = f"{s_t:+.1f}" if s_t is not None else "—"
+            phasic_str = f"{phasic_eda:+.3f}" if delta_eda is not None else "—"
+            st_str = f"{s_t:+.2f}" if s_t is not None else "—"
             print(f"[LIVE] got {len(chunk)} samples| raw_EDA={sample[eda_ch]:.4f} | "
                   f"smoothed EDA={eda_smoothed:.4f} μS | HR={hr_str} BPM | "
                   f"RMSSD={rmssd_str} ms | ΔHR={dhr_str}% | ΔHRV={dhrv_str}% | "
-                  f"ΔEDA={deda_str}% | S_t={st_str} | {state} -> unity:{unity_cmd}")
+                  f"phasicEDA={phasic_str} μS | S_t={st_str} | {state} -> unity:{unity_cmd}")
 
     tick += 1
     time.sleep(LOOP_SLEEP_S)
