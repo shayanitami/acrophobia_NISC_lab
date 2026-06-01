@@ -18,7 +18,7 @@ from pylsl import StreamInfo, StreamOutlet
 # them on correctly-labelled LSL channels (ch0=digital, ch1=EDA, ch2=ECG).
 # ------------------------------------------------------------------
 
-FILE = r"C:\Users\Shayan\Desktop\NICS\acrophobia\shayan_code\vret_pipeline\paria_onmylaptop_opensignals_2026-05-25_15-13-39.txt"
+FILE = r"C:\Users\Shayan\Desktop\samples\1_2026-05-25_15-13-39.txt"
 
 # ---- parse the JSON device block on the 2nd header line ----
 with open(FILE, "r") as f:

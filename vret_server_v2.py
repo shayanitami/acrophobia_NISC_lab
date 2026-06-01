@@ -149,6 +149,17 @@ HR_SIGMA_FLOOR_PCT      = 2.0      # resting HR spread is realistically >= ~2%
 HRV_SIGMA_FLOOR_PCT     = 5.0      # resting RMSSD deviation spread >= ~5%
 EDA_PHASIC_SIGMA_FLOOR  = 0.02     # phasic-EDA spread floor in uS
 
+# Physiological ceiling for a phasic-EDA value. Real phasic skin-conductance
+# responses are tenths of a uS; even a large startle SCR rarely exceeds ~1 uS.
+# Values far above this are not physiology — they are filter ringing from a
+# resampler edge artifact in the phasic decomposition (the resampler intermittently
+# appends a spurious ~0 final sample; nk's zero-phase filter then rings backward
+# across the tail, and that ringing can reach 4-15 uS). We do NOT try to repair the
+# decomposition (the repair heuristics risk misfiring on real data); we simply
+# reject an implausible phasic reading so a known-garbage value can never reach the
+# score / Unity. This caps the blast radius of a rare (~0.5% of ticks) artifact.
+EDA_PHASIC_MAX_US       = 1.0
+
 SIGMA_THRESHOLD         = 3              # 3-sigma cleaning for EDA baseline mean
 
 # ---- Unity UDP output ----
@@ -185,8 +196,10 @@ def compute_phasic_eda(raw_eda_window, src_rate=SAMPLING_RATE_HZ):
     LAST phasic value (the current event-driven response, tonic drift removed).
 
     Resamples to EDA_DECOMP_RATE_HZ, cleans, runs nk.eda_phasic, returns the
-    final phasic sample in uS. Returns 0.0 if the window is too short or the
-    decomposition fails (0.0 = "no phasic deviation", the safe neutral value).
+    final phasic sample in uS. Returns 0.0 if the window is too short, the
+    decomposition fails, or the value is physiologically implausible
+    (|phasic| > EDA_PHASIC_MAX_US, i.e. resampler/filter ringing rather than a
+    real SCR). 0.0 = "no phasic deviation", the safe neutral value.
     """
     a = np.asarray(raw_eda_window, dtype=float)
     if a.size < src_rate * 5:          # need a few seconds to decompose
@@ -198,7 +211,15 @@ def compute_phasic_eda(raw_eda_window, src_rate=SAMPLING_RATE_HZ):
         phasic = nk.eda_phasic(ds, sampling_rate=EDA_DECOMP_RATE_HZ)["EDA_Phasic"].values
         if phasic.size == 0:
             return 0.0
-        return float(phasic[-1])
+        val = float(phasic[-1])
+        # Plausibility ceiling: real phasic SCRs are well under 1 uS. A larger
+        # magnitude is filter ringing from a resampler edge artifact, not arousal.
+        # Reject it (treat as no deviation) so garbage never reaches the score.
+        if not np.isfinite(val) or abs(val) > EDA_PHASIC_MAX_US:
+            print(f"[EDA-CLAMP] implausible phasic {val:+.2f} uS rejected "
+                  f"(> {EDA_PHASIC_MAX_US} uS = decomposition artifact, not a real SCR).")
+            return 0.0
+        return val
     except Exception:
         return 0.0
 
