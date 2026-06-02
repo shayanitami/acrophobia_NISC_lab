@@ -33,10 +33,6 @@ ENV/
 \#*\#
 .\#*
 
-# VS Code / JetBrains
-.vscode/
-.idea/
-
 # ─── OS junk ──────────────────────────────────────────────────────────────
 .DS_Store
 Thumbs.db
@@ -46,9 +42,5 @@ desktop.ini
 # Session CSVs produced by the live pipeline (these get re-generated; not
 # meaningful to track in git unless a specific session is committed as a sample)
 vret_session_*.csv
-
-# Stray terminal-output captures
-*_terminal_result.txt
-*_terminal_output.txt
 
 
