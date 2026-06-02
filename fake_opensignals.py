@@ -1,6 +1,7 @@
 import numpy as np
 import time
 import json
+import socket
 from pylsl import StreamInfo, StreamOutlet
 
 # ------------------------------------------------------------------
@@ -18,7 +19,7 @@ from pylsl import StreamInfo, StreamOutlet
 # them on correctly-labelled LSL channels (ch0=digital, ch1=EDA, ch2=ECG).
 # ------------------------------------------------------------------
 
-FILE = r"C:\Users\Shayan\Desktop\samples\1_2026-05-25_15-13-39.txt"
+FILE = r"C:\Users\Shayan\Desktop\samples\14_minute_test_of_myself_2026-05-26_16-47-36.txt"
 
 # ---- parse the JSON device block on the 2nd header line ----
 with open(FILE, "r") as f:
@@ -65,6 +66,34 @@ for _label, _unit in [("digital", ""), ("EDA", "uS"), ("ECG", "mV")]:
 
 outlet = StreamOutlet(info)
 print("Broadcasting on LSL (ch0=digital, ch1=EDA, ch2=ECG). Run vret_server.py now.")
+
+# ------------------------------------------------------------------
+# START HANDSHAKE (so runs are comparable):
+# The outlet (with its channel labels) is created above immediately, so the
+# server can resolve the stream and read labels during its own startup. But we
+# DO NOT push any samples until the server sends a "start" packet (it does this
+# when you press enter). That way every run begins replaying at sample 0,
+# aligned to the server's baseline start — instead of streaming from whenever
+# this script happened to launch, which made baseline land on a different part
+# of the recording each run. Set WAIT_FOR_START = False to stream immediately
+# (old behaviour).
+# ------------------------------------------------------------------
+WAIT_FOR_START   = True
+CONTROL_UDP_IP   = "127.0.0.1"
+CONTROL_UDP_PORT = 5006
+
+if WAIT_FOR_START:
+    _sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    _sock.bind((CONTROL_UDP_IP, CONTROL_UDP_PORT))
+    print(f"[wait] holding at sample 0; waiting for 'start' from vret_server.py "
+          f"on {CONTROL_UDP_IP}:{CONTROL_UDP_PORT} (press enter in the server)...")
+    while True:
+        data_pkt, _addr = _sock.recvfrom(64)
+        if data_pkt.strip().lower() == b"start":
+            break
+    _sock.close()
+    print("[start] received 'start' — replaying recording from sample 0.")
+
 # Play the recording through ONCE and stop at end-of-data (no looping). This
 # mirrors a real session, which is finite; looping would feed the server the
 # same data repeatedly and could mask end-of-stream handling.
