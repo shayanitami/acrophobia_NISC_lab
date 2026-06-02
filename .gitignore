@@ -1,29 +1,54 @@
-
-n
+# ─── Python ───────────────────────────────────────────────────────────────
 __pycache__/
-*.pyc
-*.pyo
+*.py[cod]
+*$py.class
+*.so
+.Python
 
-# Virtual environment
+# Distribution / build
+build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
+pip-wheel-metadata/
+
+# ─── Virtual environments (machine-specific, never commit) ────────────────
 vret_env/
+venv/
+env/
+.venv/
+ENV/
 
-# OpenSignals raw recordings (large, not source code)
-*.h5
-*.edf
-opensignals_*.txt
-fake_opensignals_*.txt
-
-
-# vim swap and undo files
+# ─── Editor backup / swap / undo files ────────────────────────────────────
+# Vim (the source of the *~ and *.un~ files in this repo)
 *~
-*.un~
-.*.un~
 *.swp
 *.swo
+*.un~
+.*.un~
+.*.sw[a-z]
 
+# Emacs
+\#*\#
+.\#*
 
+# VS Code / JetBrains
+.vscode/
+.idea/
 
-# OS / editor cruft
+# ─── OS junk ──────────────────────────────────────────────────────────────
 .DS_Store
 Thumbs.db
-*.swp
+desktop.ini
+
+# ─── Local-only runtime output ────────────────────────────────────────────
+# Session CSVs produced by the live pipeline (these get re-generated; not
+# meaningful to track in git unless a specific session is committed as a sample)
+vret_session_*.csv
+
+# Stray terminal-output captures
+*_terminal_result.txt
+*_terminal_output.txt
+
+
